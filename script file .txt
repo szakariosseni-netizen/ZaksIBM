@@ -1,0 +1,389 @@
+﻿#!/usr/bin/env bash
+set -euo pipefail
+
+
+# ---------------------- SIMPLIFIED CONFIG ---------------------
+BASE_LOG_DIR="/logdepot/ibm/was/logs"
+DEST_BASE="/bmpstools/AAA-NP-Log.files"
+SERVICE_USER="bpmsvc"  # User to switch to for archive/copy operations
+
+
+# Define your environments and nodes here
+declare -A SERVERS=(
+    ["PRODLIKE-Node1"]="10.36.94.51"
+    ["PRODLIKE-Node2"]="10.36.94.52"
+    ["PRODLIKE-Node3"]="10.36.94.53"
+    ["PRODLIKE-Node4"]="10.36.94.54"
+    ["DEV-Node1"]="10.209.234.251"
+    ["DEV-Node2"]="10.209.234.252"
+    ["TST-Node1"]="10.220.132.227"
+    ["TST-Node2"]="10.220.132.228"
+)
+
+
+SSHPASS_BIN="$(command -v sshpass 2>/dev/null || true)"
+# --------------------------------------------------------------
+
+
+echo "=== WAS Log Retriever (Enhanced) ==="
+echo
+
+
+# Get credentials
+read -p "Username: " USERNAME
+read -sp "Password (or press Enter for SSH key): " PASSWORD
+echo
+echo
+
+
+# Show available servers
+echo "Available servers:"
+i=1
+declare -a SERVER_LIST=()
+for server in "${!SERVERS[@]}"; do
+    echo "  $i) $server (${SERVERS[$server]})"
+    SERVER_LIST+=("$server")
+    ((i++))
+done
+echo
+
+
+# Get server selection (now supports multiple)
+echo "You can select multiple servers using:"
+echo "  - Single: 1"
+echo "  - Multiple: 1,3,5"
+echo "  - Range: 1-4"
+echo "  - Mixed: 1,3-5,7"
+echo
+read -p "Select server(s) (1-${#SERVER_LIST[@]}): " SERVER_SELECTION
+
+
+# Parse server selection
+declare -a SELECTED_SERVERS=()
+IFS=',' read -ra PARTS <<< "$SERVER_SELECTION"
+for part in "${PARTS[@]}"; do
+    part="${part// /}"  # Remove whitespace
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        # Range
+        start="${BASH_REMATCH[1]}"
+        end="${BASH_REMATCH[2]}"
+        for ((j=start; j<=end; j++)); do
+            if [ "$j" -ge 1 ] && [ "$j" -le "${#SERVER_LIST[@]}" ]; then
+                SELECTED_SERVERS+=("${SERVER_LIST[$((j-1))]}")
+            fi
+        done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+        # Single number
+        if [ "$part" -ge 1 ] && [ "$part" -le "${#SERVER_LIST[@]}" ]; then
+            SELECTED_SERVERS+=("${SERVER_LIST[$((part-1))]}")
+        fi
+    fi
+done
+
+
+# Remove duplicates
+SELECTED_SERVERS=($(printf '%s\n' "${SELECTED_SERVERS[@]}" | sort -u))
+
+
+if [ "${#SELECTED_SERVERS[@]}" -eq 0 ]; then
+    echo "ERROR: No valid servers selected."
+    exit 1
+fi
+
+
+echo
+echo "Selected ${#SELECTED_SERVERS[@]} server(s):"
+printf '  - %s (%s)\n' "${SELECTED_SERVERS[@]/%/ ${SERVERS[${SELECTED_SERVERS[@]}]}}"
+for srv in "${SELECTED_SERVERS[@]}"; do
+    echo "  - $srv (${SERVERS[$srv]})"
+done
+echo
+
+
+# Ask about user switching once for all operations
+USE_SERVICE_USER="no"
+while true; do
+    read -p "Switch to service user ($SERVICE_USER) for file operations? (y/n): " SWITCH_USER
+    case "${SWITCH_USER,,}" in
+        y|yes) USE_SERVICE_USER="yes"; break ;;
+        n|no) USE_SERVICE_USER="no"; break ;;
+        *) echo "Please answer y or n." ;;
+    esac
+done
+echo
+
+
+# SSH helper function
+run_ssh() {
+    local target_ip="$1"
+    local cmd="$2"
+    if [[ -n "$SSHPASS_BIN" && -n "$PASSWORD" ]]; then
+        sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 \
+            -l "$USERNAME" "$target_ip" "$cmd" 2>/dev/null
+    else
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 \
+            -l "$USERNAME" "$target_ip" "$cmd" 2>/dev/null
+    fi
+}
+
+
+# Function to process a single server
+process_server() {
+    local SELECTED_SERVER="$1"
+    local SELECTED_IP="${SERVERS[$SELECTED_SERVER]}"
+    local ENV_NAME="${SELECTED_SERVER%%-*}"
+    
+    echo "========================================"
+    echo "Processing: $SELECTED_SERVER ($SELECTED_IP)"
+    echo "========================================"
+    echo
+
+
+    # Test connection and verify base directory
+    echo "Testing connection to $SELECTED_IP..."
+    if ! run_ssh "$SELECTED_IP" "test -d '$BASE_LOG_DIR'"; then
+        echo "ERROR: Cannot connect to $SELECTED_IP or directory $BASE_LOG_DIR does not exist."
+        echo "Skipping this server."
+        echo
+        return 1
+    fi
+    echo "Connection successful."
+    echo
+
+
+    # List log types
+    echo "Discovering log types..."
+    LOG_TYPES=$(run_ssh "$SELECTED_IP" "ls -1 '$BASE_LOG_DIR' 2>/dev/null" || echo "")
+    if [[ -z "$LOG_TYPES" ]]; then
+        echo "ERROR: No log directories found in $BASE_LOG_DIR"
+        echo "Skipping this server."
+        echo
+        return 1
+    fi
+
+
+    # Show log types
+    echo "Available log types:"
+    i=1
+    declare -a TYPE_LIST=()
+    while IFS= read -r type; do
+        [[ -z "$type" ]] && continue
+        echo "  $i) $type"
+        TYPE_LIST+=("$type")
+        ((i++))
+    done <<< "$LOG_TYPES"
+    echo
+
+
+    # Select log type
+    while true; do
+        read -p "Select log type number (1-${#TYPE_LIST[@]}): " TYPE_NUM
+        if [[ "$TYPE_NUM" =~ ^[0-9]+$ ]] && [ "$TYPE_NUM" -ge 1 ] && [ "$TYPE_NUM" -le "${#TYPE_LIST[@]}" ]; then
+            SELECTED_TYPE="${TYPE_LIST[$((TYPE_NUM-1))]}"
+            break
+        fi
+        echo "Invalid selection. Please enter a number between 1 and ${#TYPE_LIST[@]}."
+    done
+
+
+    LOG_PATH="$BASE_LOG_DIR/$SELECTED_TYPE"
+    echo "Selected: $SELECTED_TYPE"
+    echo
+
+
+    # List files in selected log type
+    echo "Listing files in $LOG_PATH..."
+    FILES=$(run_ssh "$SELECTED_IP" "cd '$LOG_PATH' && ls -1 2>/dev/null" || echo "")
+    if [[ -z "$FILES" ]]; then
+        echo "ERROR: No files found in $LOG_PATH"
+        echo "Skipping this server."
+        echo
+        return 1
+    fi
+
+
+    echo "Available files:"
+    i=1
+    declare -a FILE_LIST=()
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        echo "  $i) $file"
+        FILE_LIST+=("$file")
+        ((i++))
+    done <<< "$FILES"
+    echo
+
+
+    # File selection with pattern support
+    echo "Enter file selection:"
+    echo "  - Single number: 1"
+    echo "  - Multiple: 1,3,5"
+    echo "  - Range: 1-5"
+    echo "  - Pattern: SystemOut*.log"
+    echo "  - Mixed: 1,3,5-7,SystemErr*.log"
+    echo
+    read -p "Your selection: " SELECTION
+
+
+    # Parse selection
+    SELECTED_FILES=()
+
+
+    # Handle numeric selections
+    NUMERIC_PART=$(echo "$SELECTION" | grep -o '[0-9,\-]*' | head -1)
+    if [[ -n "$NUMERIC_PART" ]]; then
+        IFS=',' read -ra PARTS <<< "$NUMERIC_PART"
+        for part in "${PARTS[@]}"; do
+            part="${part// /}"
+            if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                start="${BASH_REMATCH[1]}"
+                end="${BASH_REMATCH[2]}"
+                for ((j=start; j<=end; j++)); do
+                    if [ "$j" -ge 1 ] && [ "$j" -le "${#FILE_LIST[@]}" ]; then
+                        SELECTED_FILES+=("${FILE_LIST[$((j-1))]}")
+                    fi
+                done
+            elif [[ "$part" =~ ^[0-9]+$ ]]; then
+                if [ "$part" -ge 1 ] && [ "$part" -le "${#FILE_LIST[@]}" ]; then
+                    SELECTED_FILES+=("${FILE_LIST[$((part-1))]}")
+                fi
+            fi
+        done
+    fi
+
+
+    # Handle pattern selections
+    PATTERN_PART=$(echo "$SELECTION" | grep -oE '[*?[:alnum:]_\.\-]+\*[[:alnum:]_\.\-]*|[*?[:alnum:]_\.\-]*\?[[:alnum:]_\.\-]*' || true)
+    if [[ -n "$PATTERN_PART" ]]; then
+        MATCHED=$(run_ssh "$SELECTED_IP" "cd '$LOG_PATH' && ls -1 $PATTERN_PART 2>/dev/null" || echo "")
+        while IFS= read -r match; do
+            [[ -n "$match" ]] && SELECTED_FILES+=("$match")
+        done <<< "$MATCHED"
+    fi
+
+
+    # Remove duplicates
+    SELECTED_FILES=($(printf '%s\n' "${SELECTED_FILES[@]}" | sort -u))
+
+
+    if [ "${#SELECTED_FILES[@]}" -eq 0 ]; then
+        echo "ERROR: No files selected or found."
+        echo "Skipping this server."
+        echo
+        return 1
+    fi
+
+
+    echo
+    echo "Selected ${#SELECTED_FILES[@]} file(s):"
+    printf '  - %s\n' "${SELECTED_FILES[@]}"
+    echo
+
+
+    # Ask about archiving
+    while true; do
+        read -p "Archive and compress files? (y/n): " ARCHIVE
+        case "${ARCHIVE,,}" in
+            y|yes) ARCHIVE="yes"; break ;;
+            n|no) ARCHIVE="no"; break ;;
+            *) echo "Please answer y or n." ;;
+        esac
+    done
+
+
+    # Create destination directory
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    NODE_DIR="${SELECTED_SERVER}_${SELECTED_IP}"
+    DEST_DIR="$DEST_BASE/$ENV_NAME/$NODE_DIR/$USERNAME/$TIMESTAMP"
+
+
+    echo
+    echo "Creating destination directory: $DEST_DIR"
+    
+    # Build the command prefix based on user switching preference
+    CMD_PREFIX=""
+    if [[ "$USE_SERVICE_USER" == "yes" ]]; then
+        echo "Switching to user: $SERVICE_USER"
+        CMD_PREFIX="sudo su - $SERVICE_USER -c"
+    fi
+
+
+    # Create directory (may need sudo depending on permissions)
+    if [[ "$USE_SERVICE_USER" == "yes" ]]; then
+        run_ssh "$SELECTED_IP" "$CMD_PREFIX 'mkdir -p \"$DEST_DIR\"'"
+    else
+        run_ssh "$SELECTED_IP" "mkdir -p '$DEST_DIR'"
+    fi
+
+
+    # Copy or archive files
+    if [[ "$ARCHIVE" == "yes" ]]; then
+        ARCHIVE_NAME="waslogs_${SELECTED_SERVER}_${TIMESTAMP}.tar.gz"
+        echo "Creating archive: $ARCHIVE_NAME"
+        
+        # Build file list for tar
+        FILE_ARGS=""
+        for file in "${SELECTED_FILES[@]}"; do
+            FILE_ARGS+="\"$LOG_PATH/$file\" "
+        done
+        
+        # Execute tar command with or without user switching
+        if [[ "$USE_SERVICE_USER" == "yes" ]]; then
+            TAR_CMD="tar -czf \"$DEST_DIR/$ARCHIVE_NAME\" $FILE_ARGS 2>/dev/null"
+            run_ssh "$SELECTED_IP" "$CMD_PREFIX '$TAR_CMD'"
+        else
+            run_ssh "$SELECTED_IP" "tar -czf '$DEST_DIR/$ARCHIVE_NAME' $FILE_ARGS 2>/dev/null"
+        fi
+        echo "Archive created successfully."
+    else
+        echo "Copying files..."
+        for file in "${SELECTED_FILES[@]}"; do
+            echo "  Copying: $file"
+            if [[ "$USE_SERVICE_USER" == "yes" ]]; then
+                CP_CMD="cp -p \"$LOG_PATH/$file\" \"$DEST_DIR/\" 2>/dev/null"
+                run_ssh "$SELECTED_IP" "$CMD_PREFIX '$CP_CMD'"
+            else
+                run_ssh "$SELECTED_IP" "cp -p '$LOG_PATH/$file' '$DEST_DIR/' 2>/dev/null"
+            fi
+        done
+        echo "Files copied successfully."
+    fi
+
+
+    echo
+    echo "=== Server Processing Complete ==="
+    echo "Environment: $ENV_NAME"
+    echo "Server: $SELECTED_SERVER ($SELECTED_IP)"
+    echo "Log Type: $SELECTED_TYPE"
+    echo "Archived: $ARCHIVE"
+    echo "User Context: $([ "$USE_SERVICE_USER" == "yes" ] && echo "$SERVICE_USER" || echo "$USERNAME")"
+    echo "Destination: $DEST_DIR"
+    echo
+    
+    return 0
+}
+
+
+# Process each selected server
+SUCCESSFUL=0
+FAILED=0
+
+
+for server in "${SELECTED_SERVERS[@]}"; do
+    if process_server "$server"; then
+        ((SUCCESSFUL++))
+    else
+        ((FAILED++))
+    fi
+done
+
+
+echo "========================================"
+echo "=== All Operations Complete ==="
+echo "========================================"
+echo "Servers processed successfully: $SUCCESSFUL"
+echo "Servers failed: $FAILED"
+echo
+
+
+exit 0
